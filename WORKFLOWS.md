@@ -1,631 +1,980 @@
-# Database Workflows
+# Database Architect - Operational Workflows
 
-## Development Workflow
+## Workflow Overview
 
-### Schema Design Process
+This document defines standard operational procedures for database architecture, schema management, performance optimization, disaster recovery, and routine maintenance tasks.
 
-#### 1. Requirements Gathering
-```markdown
-## Feature: User Preferences System
-
-### Data Requirements
-- Store user preferences as flexible key-value pairs
-- Support nested structures (theme, notifications, privacy)
-- Enable fast lookups by user_id
-- Track preference change history
-- Support default values per preference type
-
-### Performance Requirements
-- Read latency: < 50ms (p95)
-- Write latency: < 100ms (p95)
-- Support 10,000 concurrent users
-- 1M+ preference records
-
-### Compliance
-- GDPR: User preferences must be exportable and deletable
-- Data retention: Keep history for 2 years
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Database Workflow Lifecycle                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  Design Phase          Implementation        Operations          │
+│  ┌────────────┐       ┌────────────┐       ┌────────────┐      │
+│  │  Schema    │──────→│ Migration  │──────→│ Monitoring │      │
+│  │  Design    │       │ Execution  │       │ & Tuning   │      │
+│  └────────────┘       └────────────┘       └────────────┘      │
+│        │                     │                     │             │
+│        ↓                     ↓                     ↓             │
+│  Requirements          Testing              Optimization         │
+│  Validation            & Rollback           & Scaling            │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-#### 2. Schema Design
-```sql
--- V001__create_user_preferences.sql
+## Core Workflows
 
--- Main preferences table (current state)
-CREATE TABLE user_preferences (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    preferences JSONB NOT NULL DEFAULT '{}',
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT uniq_user_preferences UNIQUE (user_id)
+### Workflow 1: Schema Design & Review
+
+**Purpose:** Design database schemas following best practices and normalization principles
+
+**Triggers:**
+- New feature requiring database changes
+- Performance optimization needs
+- Data model refactoring
+
+**Steps:**
+
+**1. Gather Requirements**
+```yaml
+requirements_checklist:
+  - [ ] Identify entities and relationships
+  - [ ] Define data types and constraints
+  - [ ] Estimate data volume and growth
+  - [ ] Specify query patterns (read/write ratio)
+  - [ ] Define performance requirements (latency, throughput)
+  - [ ] Identify compliance requirements (PII, audit trails)
+```
+
+**2. Design Entity-Relationship Diagram**
+```sql
+-- Example ERD for e-commerce system
+
+-- Users table
+CREATE TABLE users (
+    user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes for performance
-CREATE INDEX idx_user_preferences_user_id ON user_preferences (user_id);
-CREATE INDEX idx_user_preferences_jsonb ON user_preferences USING gin (preferences jsonb_path_ops);
+-- Orders table
+CREATE TABLE orders (
+    order_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(user_id),
+    status VARCHAR(20) NOT NULL CHECK (status IN ('pending', 'paid', 'shipped', 'delivered', 'cancelled')),
+    total_amount DECIMAL(10,2) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
--- Audit trail (history)
-CREATE TABLE user_preferences_history (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    preferences JSONB NOT NULL,
-    changed_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    changed_by VARCHAR(100)
-) PARTITION BY RANGE (changed_at);
+-- Order items table
+CREATE TABLE order_items (
+    order_item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id UUID NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    product_id UUID NOT NULL REFERENCES products(product_id),
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price DECIMAL(10,2) NOT NULL,
+    subtotal DECIMAL(10,2) GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
 
--- Monthly partitions for history
-CREATE TABLE user_preferences_history_2026_02 PARTITION OF user_preferences_history
-    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
-
-CREATE INDEX idx_prefs_history_user_id ON user_preferences_history (user_id, changed_at DESC);
-
--- Trigger to track changes
-CREATE OR REPLACE FUNCTION log_preference_changes()
-RETURNS TRIGGER AS $$
-BEGIN
-    INSERT INTO user_preferences_history (user_id, preferences, changed_by)
-    VALUES (NEW.user_id, NEW.preferences, current_user);
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_log_preference_changes
-    AFTER INSERT OR UPDATE ON user_preferences
-    FOR EACH ROW
-    EXECUTE FUNCTION log_preference_changes();
-
--- Helper function for querying preferences
-CREATE OR REPLACE FUNCTION get_user_preference(
-    p_user_id BIGINT,
-    p_key TEXT,
-    p_default TEXT DEFAULT NULL
-)
-RETURNS TEXT AS $$
-BEGIN
-    RETURN COALESCE(
-        (SELECT preferences->>p_key FROM user_preferences WHERE user_id = p_user_id),
-        p_default
-    );
-END;
-$$ LANGUAGE plpgsql STABLE;
+-- Indexes for common queries
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_created_at ON orders(created_at DESC);
+CREATE INDEX idx_order_items_order_id ON order_items(order_id);
 ```
 
-#### 3. Review Checklist
-- [ ] Indexes on all foreign keys
-- [ ] Appropriate constraints (NOT NULL, CHECK, UNIQUE)
-- [ ] Cascade delete behavior defined
-- [ ] Partitioning strategy for large tables
-- [ ] Audit/history tracking implemented
-- [ ] Performance considerations (denormalization if needed)
-- [ ] Migration rollback script prepared
-- [ ] Data retention policy defined
-
-### Local Development Setup
-
-#### 1. Docker Compose Environment
+**3. Normalization Analysis**
 ```yaml
-# docker-compose.dev.yml
-version: '3.8'
-
-services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: dev-postgres
-    environment:
-      POSTGRES_DB: development
-      POSTGRES_USER: devuser
-      POSTGRES_PASSWORD: devpass
-      PGDATA: /var/lib/postgresql/data/pgdata
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
-    command:
-      - "postgres"
-      - "-c" "log_statement=all"
-      - "-c" "log_duration=on"
-      - "-c" "shared_preload_libraries=pg_stat_statements"
-      - "-c" "pg_stat_statements.track=all"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U devuser -d development"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  pgadmin:
-    image: dpage/pgadmin4:latest
-    container_name: dev-pgadmin
-    environment:
-      PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: admin
-    ports:
-      - "5050:80"
-    depends_on:
-      - postgres
-
-volumes:
-  postgres_data:
+normalization_review:
+  first_normal_form:
+    - [ ] All attributes contain atomic values
+    - [ ] No repeating groups
+    
+  second_normal_form:
+    - [ ] No partial dependencies on composite keys
+    
+  third_normal_form:
+    - [ ] No transitive dependencies
+    
+  denormalization_decisions:
+    - table: order_items
+      reason: Include product_name for faster queries (avoid join)
+      trade_off: Update anomaly if product renamed
 ```
 
+**4. Peer Review**
+```yaml
+review_checklist:
+  - [ ] Naming conventions followed (snake_case)
+  - [ ] Appropriate data types selected
+  - [ ] Primary keys defined
+  - [ ] Foreign key constraints specified
+  - [ ] Indexes planned for query patterns
+  - [ ] Constraints enforce business rules
+  - [ ] Migration path from existing schema documented
+```
+
+**5. Approval & Documentation**
+- Document schema in data dictionary
+- Update ER diagrams in architecture docs
+- Create JIRA ticket for implementation
+- Get sign-off from tech lead
+
+**Tools:**
+- dbdiagram.io, draw.io (ERD creation)
+- SQLFluff (SQL linting)
+- PostgreSQL documentation
+
+---
+
+### Workflow 2: Database Migration Management
+
+**Purpose:** Safely apply schema changes to production databases
+
+**Triggers:**
+- Approved schema design
+- Bug fix requiring schema change
+- Performance optimization (index addition)
+
+**Steps:**
+
+**1. Create Migration File**
 ```bash
-# Start development environment
-docker-compose -f docker-compose.dev.yml up -d
+# Use migration tool (Flyway, Liquibase, or custom)
+flyway migrate -locations=migrations/
 
-# Run migrations
-alembic upgrade head
-
-# Seed test data
-psql -h localhost -U devuser -d development -f scripts/seed-data.sql
+# Migration naming convention: V{version}__{description}.sql
+# Example: V001__create_users_table.sql
 ```
 
-#### 2. Migration Development
-```bash
-# Create new migration
-alembic revision -m "add_user_preferences_table"
-
-# Edit the generated migration file
-# alembic/versions/001_add_user_preferences_table.py
-
-# Test migration (up)
-alembic upgrade head
-
-# Test rollback (down)
-alembic downgrade -1
-
-# Verify database state
-psql -h localhost -U devuser -d development -c "\dt"
-psql -h localhost -U devuser -d development -c "\d user_preferences"
-```
-
-#### 3. Query Testing
+**Migration Template:**
 ```sql
--- Test query performance locally
-EXPLAIN (ANALYZE, BUFFERS) 
-SELECT * FROM user_preferences WHERE user_id = 123;
+-- V005__add_email_verification.sql
+-- Description: Add email verification fields to users table
+-- Author: jane.doe@company.com
+-- Date: 2026-02-11
+-- Estimated downtime: 0 seconds (non-blocking)
 
--- Check index usage
+-- Forward migration
+BEGIN;
+
+-- Add new columns (nullable initially for backward compatibility)
+ALTER TABLE users 
+  ADD COLUMN email_verified BOOLEAN DEFAULT FALSE,
+  ADD COLUMN verification_token VARCHAR(255),
+  ADD COLUMN verification_sent_at TIMESTAMP;
+
+-- Create index for token lookup
+CREATE INDEX CONCURRENTLY idx_users_verification_token 
+  ON users(verification_token) 
+  WHERE verification_token IS NOT NULL;
+
+-- Backfill existing users as verified
+UPDATE users 
+  SET email_verified = TRUE 
+  WHERE created_at < '2026-02-11';
+
+COMMIT;
+
+-- Rollback script (separate file or comment)
+-- ALTER TABLE users DROP COLUMN email_verified, DROP COLUMN verification_token, DROP COLUMN verification_sent_at;
+-- DROP INDEX idx_users_verification_token;
+```
+
+**2. Test Migration on Development Environment**
+```bash
+# Run migration
+flyway migrate -url=jdbc:postgresql://dev-db/myapp -user=admin
+
+# Verify schema
+psql -h dev-db -d myapp -c "\d users"
+
+# Test application functionality
+./run_integration_tests.sh
+
+# Test rollback
+flyway undo
+```
+
+**3. Test Migration on Staging Environment**
+```yaml
+staging_migration_checklist:
+  pre_migration:
+    - [ ] Backup staging database
+    - [ ] Verify application health (all services green)
+    - [ ] Check replication lag (< 1 second)
+    
+  migration:
+    - [ ] Apply migration (monitor for errors)
+    - [ ] Verify migration status (flyway info)
+    - [ ] Check application logs (no errors)
+    
+  post_migration:
+    - [ ] Run smoke tests
+    - [ ] Verify query performance (no regressions)
+    - [ ] Document any issues observed
+```
+
+**4. Production Migration Planning**
+```yaml
+production_migration_plan:
+  change_window: "2026-02-11 02:00-04:00 UTC"
+  estimated_duration: "15 minutes"
+  rollback_time: "5 minutes"
+  
+  prerequisites:
+    - [ ] Staging migration successful
+    - [ ] Change request approved (CR-12345)
+    - [ ] DBA assigned (on-call available)
+    - [ ] Communication sent (status page update)
+    
+  risk_assessment:
+    risk_level: medium
+    impact: "New columns added, backward compatible"
+    rollback_plan: "DROP COLUMN commands prepared"
+    
+  monitoring:
+    - Watch replication lag
+    - Monitor query latency (p95, p99)
+    - Check error rates in application logs
+    - Verify connection pool health
+```
+
+**5. Execute Production Migration**
+```bash
+# Pre-migration checks
+./pre_migration_checks.sh
+
+# Backup database (if not already automated)
+pg_dump -h prod-db -d myapp -Fc -f backup_pre_migration_$(date +%Y%m%d).dump
+
+# Apply migration
+flyway migrate -url=jdbc:postgresql://prod-db/myapp
+
+# Post-migration verification
+./post_migration_checks.sh
+
+# Update status page
+curl -X POST https://status.company.com/api/incidents/close \
+  -d '{"incident_id": "12345", "status": "resolved"}'
+```
+
+**6. Post-Migration Monitoring**
+```yaml
+monitoring_duration: 24_hours
+metrics_to_watch:
+  - query_latency_p95
+  - error_rate
+  - replication_lag
+  - connection_pool_utilization
+  
+alert_conditions:
+  - metric: query_latency_p95
+    threshold: "> 200ms"
+    action: Investigate slow queries
+    
+  - metric: error_rate
+    threshold: "> 1%"
+    action: Consider rollback
+```
+
+**Tools:**
+- Flyway, Liquibase (migration frameworks)
+- pt-online-schema-change, gh-ost (online schema changes for MySQL)
+- pgBackRest, Barman (PostgreSQL backup)
+
+---
+
+### Workflow 3: Query Performance Optimization
+
+**Purpose:** Identify and resolve slow queries
+
+**Triggers:**
+- Slow query alerts (> 1 second)
+- High CPU usage on database server
+- User complaints about slow page loads
+
+**Steps:**
+
+**1. Identify Slow Queries**
+```sql
+-- PostgreSQL: Enable pg_stat_statements
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Find top 10 slowest queries
 SELECT 
-    schemaname,
-    tablename,
-    indexname,
-    idx_scan as index_scans,
-    idx_tup_read as tuples_read,
-    idx_tup_fetch as tuples_fetched
-FROM pg_stat_user_indexes
-WHERE tablename = 'user_preferences'
-ORDER BY idx_scan DESC;
+    query,
+    calls,
+    total_exec_time / calls AS avg_time_ms,
+    total_exec_time,
+    rows / calls AS avg_rows
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
 ```
 
-## Migration Workflow
-
-### Safe Migration Process
-
-#### Phase 1: Pre-Deployment Validation
-```bash
-#!/bin/bash
-# scripts/validate-migration.sh
-
-set -e
-
-echo "=== Migration Validation ==="
-
-# 1. Syntax check
-echo "Checking SQL syntax..."
-psql -h localhost -U devuser -d development --dry-run < migrations/V001__add_column.sql
-
-# 2. Test on replica of production
-echo "Testing on staging (prod replica)..."
-psql -h staging-db.internal -U app_user -d staging < migrations/V001__add_column.sql
-
-# 3. Rollback test
-echo "Testing rollback..."
-psql -h staging-db.internal -U app_user -d staging < migrations/V001__add_column.rollback.sql
-
-# 4. Performance test
-echo "Checking migration duration..."
-START_TIME=$(date +%s)
-psql -h staging-db.internal -U app_user -d staging < migrations/V001__add_column.sql
-END_TIME=$(date +%s)
-DURATION=$((END_TIME - START_TIME))
-
-if [ $DURATION -gt 300 ]; then
-    echo "WARNING: Migration took ${DURATION}s (>5 minutes)"
-    exit 1
-fi
-
-echo "Validation passed (${DURATION}s)"
-```
-
-#### Phase 2: Zero-Downtime Migration Strategy
+**2. Analyze Query Execution Plan**
 ```sql
--- Example: Adding NOT NULL column
+-- Get detailed execution plan
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE) 
+SELECT u.username, COUNT(o.order_id) 
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.user_id
+WHERE u.created_at > '2026-01-01'
+GROUP BY u.username;
 
--- Step 1: Add nullable column (fast, no locks)
-ALTER TABLE users ADD COLUMN phone_number VARCHAR(20);
-
--- Step 2: Add default constraint (fast)
-ALTER TABLE users ALTER COLUMN phone_number SET DEFAULT '';
-
--- Step 3: Backfill in batches (avoid lock escalation)
-DO $$
-DECLARE
-    batch_size INT := 10000;
-    updated_rows INT;
-BEGIN
-    LOOP
-        UPDATE users
-        SET phone_number = ''
-        WHERE id IN (
-            SELECT id FROM users 
-            WHERE phone_number IS NULL 
-            LIMIT batch_size
-        );
-        
-        GET DIAGNOSTICS updated_rows = ROW_COUNT;
-        EXIT WHEN updated_rows = 0;
-        
-        RAISE NOTICE 'Updated % rows', updated_rows;
-        COMMIT;
-        PERFORM pg_sleep(0.1);  -- Throttle to avoid overload
-    END LOOP;
-END $$;
-
--- Step 4: Verify backfill complete
-SELECT COUNT(*) FROM users WHERE phone_number IS NULL;
--- Should return 0
-
--- Step 5: Add NOT NULL constraint (fast, validated data)
-ALTER TABLE users ALTER COLUMN phone_number SET NOT NULL;
-
--- Step 6: Add index if needed
-CREATE INDEX CONCURRENTLY idx_users_phone ON users (phone_number);
+-- Look for:
+-- • Seq Scan (should be Index Scan for large tables)
+-- • High cost estimates
+-- • Large buffer reads
+-- • Nested loops with many iterations
 ```
 
-#### Phase 3: Deployment Checklist
-```markdown
-## Migration Deployment Checklist
+**3. Optimization Strategies**
 
-### Pre-Deployment
-- [ ] Migration tested on staging (production replica)
-- [ ] Rollback script prepared and tested
-- [ ] Downtime estimate calculated (< 30s acceptable)
-- [ ] Team notified (on-call engineers)
-- [ ] Monitoring alerts adjusted (expect temp spike)
-- [ ] Database backup verified (< 24h old)
+**Strategy A: Add Missing Index**
+```sql
+-- Before: Seq Scan on orders (cost=0.00..5432.10 rows=50000)
+-- Problem: Filtering by user_id without index
 
-### Deployment Window
-- [ ] Enable maintenance mode if needed
-- [ ] Monitor connection count
-- [ ] Execute migration
-- [ ] Verify schema changes
-- [ ] Run smoke tests
-- [ ] Check application logs for errors
+-- Solution: Create index
+CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders(user_id);
 
-### Post-Deployment
-- [ ] Disable maintenance mode
-- [ ] Verify application functionality
-- [ ] Monitor query performance (pg_stat_statements)
-- [ ] Check replication lag
-- [ ] Update documentation
-- [ ] Notify team of completion
+-- After: Index Scan using idx_orders_user_id (cost=0.29..8.45 rows=15)
 ```
 
-## Backup & Recovery Workflow
+**Strategy B: Rewrite Query**
+```sql
+-- Before (slow): Subquery in SELECT
+SELECT 
+    u.username,
+    (SELECT COUNT(*) FROM orders WHERE user_id = u.user_id) AS order_count
+FROM users u;
 
-### Automated Backup
+-- After (fast): JOIN with aggregation
+SELECT 
+    u.username,
+    COUNT(o.order_id) AS order_count
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.user_id
+GROUP BY u.username;
+```
 
-#### Daily Backup Script
+**Strategy C: Use Materialized View**
+```sql
+-- For expensive aggregations that don't need real-time data
+CREATE MATERIALIZED VIEW user_order_summary AS
+SELECT 
+    u.user_id,
+    u.username,
+    COUNT(o.order_id) AS total_orders,
+    SUM(o.total_amount) AS lifetime_value
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.user_id
+GROUP BY u.user_id, u.username;
+
+-- Create index on materialized view
+CREATE INDEX idx_user_order_summary_user_id ON user_order_summary(user_id);
+
+-- Refresh materialized view (can be scheduled)
+REFRESH MATERIALIZED VIEW CONCURRENTLY user_order_summary;
+```
+
+**4. Test Optimization**
+```sql
+-- Compare before/after performance
+-- Before optimization
+\timing on
+SELECT ... FROM users WHERE ...;
+-- Time: 3421.563 ms
+
+-- After optimization
+SELECT ... FROM users WHERE ...;
+-- Time: 45.231 ms  (75x improvement)
+```
+
+**5. Deploy to Production**
+```yaml
+deployment_plan:
+  change_type: index_addition
+  impact: low (online operation)
+  
+  steps:
+    - [ ] Create index CONCURRENTLY (no table lock)
+    - [ ] Monitor index creation progress
+    - [ ] Verify query uses new index (EXPLAIN)
+    - [ ] Monitor query latency improvement
+    
+  rollback:
+    - Drop index if performance degrades
+```
+
+**Tools:**
+- pg_stat_statements (PostgreSQL)
+- MySQL slow query log
+- EXPLAIN plans
+- pgBadger (PostgreSQL log analyzer)
+
+---
+
+### Workflow 4: Database Scaling
+
+**Purpose:** Scale database to handle increased load
+
+**Triggers:**
+- CPU usage > 80% sustained
+- Connection pool exhaustion
+- Query latency degradation
+- Storage capacity warnings
+
+**Steps:**
+
+**1. Diagnose Bottleneck**
+```yaml
+bottleneck_analysis:
+  cpu_bound:
+    symptoms:
+      - High CPU usage
+      - Many concurrent queries
+    solutions:
+      - Add read replicas
+      - Optimize slow queries
+      - Cache frequently accessed data
+      
+  memory_bound:
+    symptoms:
+      - High memory usage
+      - Disk swapping
+      - Low buffer cache hit ratio
+    solutions:
+      - Increase RAM
+      - Tune shared_buffers, work_mem
+      - Optimize queries to use less memory
+      
+  io_bound:
+    symptoms:
+      - High disk I/O wait
+      - Slow query execution
+    solutions:
+      - Upgrade to SSD/NVMe
+      - Optimize indexes
+      - Partition large tables
+      
+  connection_bound:
+    symptoms:
+      - "Too many connections" errors
+      - High connection pool utilization
+    solutions:
+      - Implement connection pooling (PgBouncer)
+      - Increase max_connections (with more RAM)
+      - Optimize connection lifetime
+```
+
+**2. Vertical Scaling (Scale Up)**
+```yaml
+# Upgrade database instance size
+vertical_scaling_plan:
+  current_instance: db.r5.xlarge (4 vCPU, 32 GB RAM)
+  target_instance: db.r5.2xlarge (8 vCPU, 64 GB RAM)
+  
+  downtime: ~5 minutes (failover to standby)
+  
+  steps:
+    - [ ] Create snapshot before resize
+    - [ ] Schedule maintenance window
+    - [ ] Resize instance (AWS console or CLI)
+    - [ ] Verify new resources available
+    - [ ] Monitor performance improvement
+```
+
+**3. Horizontal Scaling (Scale Out)**
+
+**A. Add Read Replicas**
+```yaml
+# Route read traffic to replicas
+read_replica_setup:
+  primary: db-primary.internal (handles writes)
+  replicas:
+    - db-replica-1.internal (read-only)
+    - db-replica-2.internal (read-only)
+    - db-replica-3.internal (read-only)
+    
+  application_changes:
+    - Configure read/write split in ORM
+    - Use connection string with read endpoints
+    - Handle eventual consistency
+```
+
+```python
+# Application code for read/write split
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+# Write connection (primary)
+write_engine = create_engine('postgresql://db-primary.internal/myapp')
+WriteSession = sessionmaker(bind=write_engine)
+
+# Read connection (replicas with load balancing)
+read_engine = create_engine('postgresql://db-replicas.internal/myapp')
+ReadSession = sessionmaker(bind=read_engine)
+
+# Usage
+def get_user(user_id):
+    session = ReadSession()  # Read from replica
+    return session.query(User).filter_by(id=user_id).first()
+
+def create_user(data):
+    session = WriteSession()  # Write to primary
+    user = User(**data)
+    session.add(user)
+    session.commit()
+```
+
+**B. Implement Sharding**
+```yaml
+# Shard by user_id range
+sharding_strategy:
+  shard_key: user_id
+  shards:
+    - name: shard_1
+      range: 0000-4999
+      database: db-shard-1.internal
+      
+    - name: shard_2
+      range: 5000-9999
+      database: db-shard-2.internal
+```
+
+```python
+# Shard routing logic
+def get_shard(user_id):
+    if user_id < 5000:
+        return 'db-shard-1.internal'
+    else:
+        return 'db-shard-2.internal'
+
+def query_user(user_id):
+    shard_db = get_shard(user_id)
+    connection = connect(shard_db)
+    return connection.execute("SELECT * FROM users WHERE user_id = ?", user_id)
+```
+
+**4. Monitor Scaling Impact**
+```yaml
+post_scaling_metrics:
+  duration: 7_days
+  
+  metrics:
+    - cpu_utilization (should decrease)
+    - query_latency_p95 (should improve)
+    - connection_pool_usage (should decrease)
+    - replication_lag (should remain < 1s)
+    
+  success_criteria:
+    - CPU usage < 70%
+    - Query latency p95 < 100ms
+    - Connection pool < 60% utilized
+    - No errors in application logs
+```
+
+**Tools:**
+- AWS RDS, Azure Database, Google Cloud SQL (managed databases)
+- PgBouncer, ProxySQL (connection pooling)
+- Vitess, Citus (sharding)
+
+---
+
+### Workflow 5: Backup & Disaster Recovery
+
+**Purpose:** Protect data and recover from disasters
+
+**Triggers:**
+- Scheduled backups (daily, weekly)
+- Before major schema changes
+- Disaster recovery drills (quarterly)
+
+**Steps:**
+
+**1. Configure Automated Backups**
+```yaml
+# Backup configuration
+backup_config:
+  base_backups:
+    frequency: daily
+    time: 02:00 UTC
+    retention: 30 days
+    destination: s3://backups/postgres/
+    
+  wal_archiving:
+    enabled: true
+    archive_command: "aws s3 cp %p s3://wal-archive/%f"
+    retention: 7 days
+    
+  point_in_time_recovery:
+    enabled: true
+    recovery_window: 7 days
+```
+
+**2. Execute Backup**
 ```bash
-#!/bin/bash
-# scripts/backup-database.sh
-
-set -e
-
-# Configuration
-BACKUP_DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="/backups/postgresql"
-DB_HOST="db-primary.internal"
-DB_NAME="production"
-S3_BUCKET="s3://company-db-backups/postgresql"
-
-# Create backup directory
-mkdir -p "${BACKUP_DIR}"
-
-echo "Starting backup: ${BACKUP_DATE}"
-
-# Full backup using pg_dump
-pg_dump -h "${DB_HOST}" \
-    -U postgres \
-    -d "${DB_NAME}" \
-    -F custom \
-    -Z 9 \
-    -f "${BACKUP_DIR}/backup_${BACKUP_DATE}.dump" \
-    --verbose
-
-# Verify backup integrity
-pg_restore --list "${BACKUP_DIR}/backup_${BACKUP_DATE}.dump" > /dev/null
-if [ $? -eq 0 ]; then
-    echo "Backup integrity verified"
-else
-    echo "Backup verification failed!"
-    exit 1
-fi
+# PostgreSQL base backup
+pg_basebackup \
+  -h db-primary.internal \
+  -D /backup/base/$(date +%Y%m%d) \
+  -Ft -z -P \
+  -U backup_user
 
 # Upload to S3
-aws s3 cp "${BACKUP_DIR}/backup_${BACKUP_DATE}.dump" \
-    "${S3_BUCKET}/full/backup_${BACKUP_DATE}.dump" \
-    --storage-class STANDARD_IA
+aws s3 sync /backup/base/$(date +%Y%m%d) \
+  s3://backups/postgres/$(date +%Y%m%d)/
 
-# WAL archiving (continuous backup)
-envdir /etc/wal-g.d/env wal-g backup-push "${PGDATA}"
-
-# Cleanup old local backups (keep 7 days)
-find "${BACKUP_DIR}" -name "backup_*.dump" -mtime +7 -delete
-
-echo "Backup completed successfully"
-
-# Send notification
-curl -X POST https://hooks.slack.com/services/xxx \
-    -H 'Content-Type: application/json' \
-    -d "{\"text\":\"Database backup completed: ${BACKUP_DATE}\"}"
+# Verify backup integrity
+pg_verifybackup /backup/base/$(date +%Y%m%d)
 ```
 
-### Point-in-Time Recovery (PITR)
+**3. Test Restore (Monthly)**
+```yaml
+restore_test_plan:
+  frequency: monthly
+  environment: staging
+  
+  steps:
+    - [ ] Provision new database instance
+    - [ ] Restore from latest backup
+    - [ ] Apply WAL archives (PITR)
+    - [ ] Verify data integrity (row counts, checksums)
+    - [ ] Test application connectivity
+    - [ ] Document restore time (RTO metric)
+    - [ ] Destroy test instance
+```
 
-#### Recovery Procedure
+**4. Disaster Recovery Procedure**
+```yaml
+# Primary database failure scenario
+disaster_recovery_steps:
+  1_detect_failure:
+    - Health check fails for 3 consecutive attempts
+    - Alert sent to on-call DBA
+    
+  2_assess_damage:
+    - Check if primary is recoverable
+    - Determine data loss extent (RPO)
+    
+  3_failover_to_standby:
+    - Promote standby replica to primary
+    - Update DNS records
+    - Redirect application traffic
+    
+  4_verify_operations:
+    - Test write operations
+    - Check replication to remaining replicas
+    - Monitor error rates
+    
+  5_post_incident:
+    - Root cause analysis
+    - Update runbooks
+    - Schedule DR drill review
+```
+
+**5. Point-in-Time Recovery**
 ```bash
-#!/bin/bash
-# scripts/restore-database.sh
+# Restore to specific timestamp (e.g., before bad deployment)
+# Step 1: Restore base backup
+pg_restore \
+  -h db-recovery.internal \
+  -d myapp \
+  /backup/base/20260211
 
-set -e
-
-TARGET_TIME="2026-02-11 10:00:00 UTC"
-BACKUP_ID="backup_20260211_020000"
-PGDATA="/var/lib/postgresql/15/main"
-
-echo "=== Point-in-Time Recovery ==="
-echo "Target time: ${TARGET_TIME}"
-
-# 1. Stop PostgreSQL
-systemctl stop postgresql
-
-# 2. Backup current data (just in case)
-mv "${PGDATA}" "${PGDATA}.bak.$(date +%s)"
-
-# 3. Restore base backup
-envdir /etc/wal-g.d/env wal-g backup-fetch "${PGDATA}" "${BACKUP_ID}"
-
-# 4. Create recovery configuration
-cat > "${PGDATA}/recovery.signal" <<EOF
-# Point-in-time recovery configuration
-restore_command = 'envdir /etc/wal-g.d/env wal-g wal-fetch "%f" "%p"'
-recovery_target_time = '${TARGET_TIME}'
+# Step 2: Configure recovery target
+cat > /var/lib/postgresql/data/recovery.conf << EOF
+restore_command = 'aws s3 cp s3://wal-archive/%f %p'
+recovery_target_time = '2026-02-11 09:30:00'
 recovery_target_action = 'promote'
 EOF
 
-# 5. Set permissions
-chown -R postgres:postgres "${PGDATA}"
-chmod 700 "${PGDATA}"
-
-# 6. Start PostgreSQL (will replay WAL logs)
-echo "Starting recovery process..."
+# Step 3: Start PostgreSQL (applies WAL up to target time)
 systemctl start postgresql
 
-# 7. Monitor recovery progress
-while [ -f "${PGDATA}/recovery.signal" ]; do
-    echo "Recovery in progress..."
-    sleep 5
-done
-
-echo "Recovery completed!"
-
-# 8. Verify database state
-psql -U postgres -d production -c "SELECT NOW() as current_time, pg_last_wal_replay_lsn() as replay_lsn;"
-
-# 9. Verify data integrity
-psql -U postgres -d production -c "SELECT COUNT(*) FROM users;"
-psql -U postgres -d production -c "SELECT COUNT(*) FROM orders WHERE created_at < '${TARGET_TIME}';"
+# Step 4: Verify recovered data
+psql -c "SELECT NOW();"  # Should show recovery target time
 ```
 
-## Performance Optimization Workflow
+**Tools:**
+- pgBackRest, Barman (PostgreSQL backup tools)
+- AWS Backup, Azure Backup (cloud-native)
+- Percona XtraBackup (MySQL)
 
-### Query Analysis
+---
 
-#### 1. Identify Slow Queries
+### Workflow 6: Security Audit & Compliance
+
+**Purpose:** Ensure database security and regulatory compliance
+
+**Triggers:**
+- Quarterly security audits
+- Compliance requirements (SOC 2, HIPAA, GDPR)
+- Security incident
+
+**Steps:**
+
+**1. Access Control Audit**
 ```sql
--- Top 10 slowest queries by mean execution time
+-- Review all database users and roles
 SELECT 
-    substring(query, 1, 100) as short_query,
-    round(mean_exec_time::numeric, 2) as avg_time_ms,
-    calls,
-    round(total_exec_time::numeric, 2) as total_time_ms,
-    round((100 * total_exec_time / sum(total_exec_time) OVER ())::numeric, 2) as pct_total_time
-FROM pg_stat_statements
-WHERE query NOT LIKE '%pg_stat_statements%'
-ORDER BY mean_exec_time DESC
-LIMIT 10;
+    rolname AS role,
+    rolsuper AS is_superuser,
+    rolcreatedb AS can_create_db,
+    rolcanlogin AS can_login
+FROM pg_roles
+ORDER BY rolname;
 
--- Queries with lowest cache hit ratio
+-- Review table-level permissions
 SELECT 
-    substring(query, 1, 100) as short_query,
-    calls,
-    shared_blks_hit,
-    shared_blks_read,
-    round(
-        (shared_blks_hit::numeric / NULLIF(shared_blks_hit + shared_blks_read, 0) * 100)::numeric, 
-        2
-    ) as cache_hit_ratio
-FROM pg_stat_statements
-WHERE (shared_blks_hit + shared_blks_read) > 0
-ORDER BY cache_hit_ratio ASC
-LIMIT 10;
+    grantee,
+    table_schema,
+    table_name,
+    privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY grantee, table_name;
 ```
 
-#### 2. Analyze Query Plans
+**Checklist:**
+```yaml
+access_control_audit:
+  - [ ] No unnecessary superuser accounts
+  - [ ] Service accounts follow least privilege
+  - [ ] No shared credentials
+  - [ ] Unused accounts disabled
+  - [ ] Default passwords changed
+  - [ ] Strong password policy enforced
+```
+
+**2. Encryption Verification**
+```yaml
+encryption_audit:
+  at_rest:
+    - [ ] Disk encryption enabled (LUKS, AWS EBS encryption)
+    - [ ] TDE (Transparent Data Encryption) configured
+    - [ ] Backup encryption enabled
+    - [ ] Key rotation schedule defined
+    
+  in_transit:
+    - [ ] SSL/TLS enforced for all connections
+    - [ ] Certificate expiration monitored
+    - [ ] Weak ciphers disabled
+    - [ ] mTLS for service-to-service communication
+```
+
+**3. Audit Logging Review**
 ```sql
--- Get detailed execution plan
-EXPLAIN (ANALYZE, BUFFERS, VERBOSE, COSTS, TIMING) 
-SELECT o.id, o.created_at, u.email, o.total_amount
-FROM orders o
-JOIN users u ON o.user_id = u.id
-WHERE o.status = 'pending'
-  AND o.created_at >= NOW() - INTERVAL '30 days'
-ORDER BY o.created_at DESC
-LIMIT 100;
+-- Enable audit logging
+ALTER SYSTEM SET log_statement = 'ddl';  -- Log DDL commands
+ALTER SYSTEM SET log_connections = on;   -- Log connections
+ALTER SYSTEM SET log_disconnections = on;
+ALTER SYSTEM SET log_duration = on;      -- Log query duration
+SELECT pg_reload_conf();
+
+-- Review audit logs
+SELECT * FROM pg_read_file('pg_log/postgresql-2026-02-11.log');
 ```
 
-#### 3. Index Optimization
-```sql
--- Find missing indexes (tables without indexes on foreign keys)
-SELECT 
-    c.conrelid::regclass AS table_name,
-    string_agg(a.attname, ', ' ORDER BY x.n) AS columns,
-    'CREATE INDEX idx_' || c.conrelid::regclass || '_' || 
-        array_to_string(array_agg(a.attname ORDER BY x.n), '_') ||
-    ' ON ' || c.conrelid::regclass || ' (' || 
-        string_agg(a.attname, ', ' ORDER BY x.n) || ');' AS create_index
-FROM pg_constraint c
-CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS x(attnum, n)
-JOIN pg_attribute a ON a.attnum = x.attnum AND a.attrelid = c.conrelid
-WHERE c.contype = 'f'
-  AND NOT EXISTS (
-      SELECT 1 FROM pg_index i
-      WHERE i.indrelid = c.conrelid
-        AND c.conkey::int[] <@ i.indkey::int[]
-  )
-GROUP BY c.conrelid, c.conname
-ORDER BY table_name;
-
--- Find unused indexes (candidates for removal)
-SELECT 
-    schemaname,
-    tablename,
-    indexname,
-    idx_scan as scans,
-    pg_size_pretty(pg_relation_size(indexrelid)) as size
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-  AND indexrelname NOT LIKE 'pg_toast%'
-ORDER BY pg_relation_size(indexrelid) DESC;
-```
-
-### Database Tuning
-
-#### PostgreSQL Configuration Tuning
-```ini
-# postgresql.conf - Production optimizations
-
-# Memory
-shared_buffers = 8GB                    # 25% of RAM
-effective_cache_size = 24GB             # 75% of RAM
-work_mem = 64MB                         # RAM / max_connections / 4
-maintenance_work_mem = 2GB              # For VACUUM, CREATE INDEX
-wal_buffers = 16MB
-
-# Checkpoints
-checkpoint_completion_target = 0.9
-checkpoint_timeout = 15min
-max_wal_size = 4GB
-min_wal_size = 1GB
-
-# Query Planning
-default_statistics_target = 100
-random_page_cost = 1.1                  # SSD storage
-effective_io_concurrency = 200          # SSD storage
-
-# Connections
-max_connections = 200
-superuser_reserved_connections = 3
-
-# Logging
-log_min_duration_statement = 1000       # Log queries > 1 second
-log_checkpoints = on
-log_connections = on
-log_disconnections = on
-log_lock_waits = on
-log_autovacuum_min_duration = 0
-
-# Autovacuum
-autovacuum = on
-autovacuum_max_workers = 4
-autovacuum_naptime = 30s
-autovacuum_vacuum_threshold = 50
-autovacuum_vacuum_scale_factor = 0.1
-autovacuum_analyze_threshold = 50
-autovacuum_analyze_scale_factor = 0.05
-
-# Replication
-wal_level = replica
-max_wal_senders = 10
-wal_keep_size = 10GB
-hot_standby = on
-```
-
-## Monitoring Workflow
-
-### Daily Health Check
+**4. Vulnerability Scan**
 ```bash
-#!/bin/bash
-# scripts/db-health-check.sh
+# Scan for known vulnerabilities
+nmap -sV -p 5432 db-primary.internal
 
-echo "=== PostgreSQL Health Check ==="
+# Check PostgreSQL version
+psql -c "SELECT version();"
 
-# Connection count
-echo -e "\n1. Connection Status:"
-psql -U postgres -d production -c "
+# Verify no default/weak passwords
+./check_weak_passwords.sh
+
+# Review network exposure
+netstat -an | grep 5432
+```
+
+**5. Compliance Reporting**
+```yaml
+# GDPR compliance example
+gdpr_compliance:
+  data_inventory:
+    - [ ] PII fields documented (email, name, address)
+    - [ ] Data retention policies defined
+    - [ ] Data processing agreements signed
+    
+  user_rights:
+    - [ ] Right to access (data export capability)
+    - [ ] Right to erasure (delete user data)
+    - [ ] Right to rectification (update user data)
+    - [ ] Right to portability (JSON/CSV export)
+    
+  security_measures:
+    - [ ] Encryption at rest and in transit
+    - [ ] Access controls and audit logging
+    - [ ] Regular security audits
+    - [ ] Incident response plan
+```
+
+**Tools:**
+- OpenSCAP, Lynis (security scanners)
+- pgAudit (PostgreSQL audit extension)
+- Vault, AWS Secrets Manager (secrets management)
+
+---
+
+## Operational Runbooks
+
+### Runbook: Database Connection Issues
+
+**Symptoms:**
+- Application errors: "Too many connections"
+- High connection pool utilization
+- Slow query performance
+
+**Diagnosis:**
+```sql
+-- Check current connections
 SELECT 
+    COUNT(*) AS total_connections,
+    MAX(max_connections) AS max_allowed
+FROM pg_stat_activity, pg_settings
+WHERE name = 'max_connections';
+
+-- Identify idle connections
+SELECT 
+    pid,
+    usename,
+    application_name,
     state,
-    COUNT(*) as connections
+    NOW() - state_change AS idle_duration
 FROM pg_stat_activity
-WHERE datname = 'production'
-GROUP BY state;"
+WHERE state = 'idle'
+ORDER BY idle_duration DESC;
+```
 
-# Database size
-echo -e "\n2. Database Size:"
-psql -U postgres -d production -c "
-SELECT 
-    pg_size_pretty(pg_database_size('production')) as size;"
+**Resolution:**
+```sql
+-- Terminate idle connections (> 1 hour idle)
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle'
+  AND NOW() - state_change > INTERVAL '1 hour';
 
-# Table bloat
-echo -e "\n3. Table Bloat (top 5):"
-psql -U postgres -d production -c "
-SELECT 
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size,
-    round(100 * (pg_total_relation_size(schemaname||'.'||tablename) - 
-        pg_relation_size(schemaname||'.'||tablename))::numeric / 
-        NULLIF(pg_total_relation_size(schemaname||'.'||tablename), 0), 2) as bloat_pct
-FROM pg_tables
-WHERE schemaname = 'public'
-ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
-LIMIT 5;"
-
-# Replication lag
-echo -e "\n4. Replication Lag:"
-psql -U postgres -d production -c "
-SELECT 
-    client_addr,
-    state,
-    write_lag,
-    flush_lag,
-    replay_lag
-FROM pg_stat_replication;"
-
-# Cache hit ratio
-echo -e "\n5. Cache Hit Ratio:"
-psql -U postgres -d production -c "
-SELECT 
-    round(100.0 * sum(heap_blks_hit) / NULLIF(sum(heap_blks_hit + heap_blks_read), 0), 2) as cache_hit_ratio
-FROM pg_statio_user_tables;"
-
-echo -e "\n=== Health Check Complete ==="
+-- Increase max_connections (requires restart)
+ALTER SYSTEM SET max_connections = 300;
+SELECT pg_reload_conf();  -- or restart PostgreSQL
 ```
 
 ---
 
-**Related Documentation:**
-- [README.md](./README.md) - System overview and quick start
-- [ARCHITECTURE.md](./ARCHITECTURE.md) - Detailed architecture and data models
-- [INTEGRATION.md](./INTEGRATION.md) - Application and tool integrations
+### Runbook: Replication Lag
+
+**Symptoms:**
+- Stale data on replicas
+- Replication lag metric increasing
+- Read queries returning old data
+
+**Diagnosis:**
+```sql
+-- Check replication status (on primary)
+SELECT 
+    client_addr AS replica,
+    state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    sync_state,
+    (sent_lsn - replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+
+-- Check replication lag in seconds
+SELECT 
+    NOW() - pg_last_xact_replay_timestamp() AS replication_lag
+FROM pg_stat_replication;
+```
+
+**Resolution:**
+```yaml
+short_term:
+  - Reduce write load on primary
+  - Scale up replica resources (CPU, I/O)
+  - Optimize slow queries on replica
+  
+long_term:
+  - Upgrade replica instance size
+  - Implement connection pooling
+  - Consider sharding to distribute writes
+```
+
+---
+
+## Monitoring Dashboards
+
+### Dashboard: Database Health
+```yaml
+panels:
+  - title: Query Latency (p95)
+    query: histogram_quantile(0.95, rate(pg_query_duration_seconds_bucket[5m]))
+    threshold_warning: 100ms
+    threshold_critical: 500ms
+    
+  - title: Connection Pool Utilization
+    query: pg_connections_active / pg_connections_max * 100
+    threshold_warning: 70%
+    threshold_critical: 90%
+    
+  - title: Replication Lag
+    query: pg_replication_lag_seconds
+    threshold_warning: 5s
+    threshold_critical: 30s
+    
+  - title: Disk Usage
+    query: (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) * 100
+    threshold_warning: 80%
+    threshold_critical: 90%
+```
+
+## Best Practices Summary
+
+1. **Schema Design**
+   - Follow normalization principles (3NF minimum)
+   - Use appropriate data types
+   - Define constraints and indexes
+   - Document all schema changes
+
+2. **Migrations**
+   - Test on staging before production
+   - Use backward-compatible changes when possible
+   - Always have rollback plan
+   - Monitor post-migration performance
+
+3. **Performance**
+   - Monitor slow queries (> 1 second)
+   - Use EXPLAIN for query optimization
+   - Create indexes for frequent queries
+   - Cache frequently accessed data
+
+4. **Backups**
+   - Automate daily backups
+   - Test restores monthly
+   - Enable point-in-time recovery
+   - Store backups in separate region
+
+5. **Security**
+   - Follow least privilege principle
+   - Enable SSL/TLS encryption
+   - Audit access regularly
+   - Rotate credentials quarterly
+
+## References
+
+- [PostgreSQL Administration](https://www.postgresql.org/docs/current/admin.html)
+- [MySQL Performance Tuning](https://dev.mysql.com/doc/refman/8.0/en/optimization.html)
+- [Database Reliability Engineering](https://www.oreilly.com/library/view/database-reliability-engineering/9781491925935/)
+- [Google SRE Book - Managing Database Reliability](https://sre.google/sre-book/managing-critical-state/)
